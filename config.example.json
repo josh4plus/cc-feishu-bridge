@@ -1,0 +1,23 @@
+{
+  "appId": "cli_xxxxxxxxxxxxxxxx",
+  "appSecret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+
+  "botOpenId": "",
+  "allowedOpenIds": [],
+  "defaultChatId": "",
+
+  "claudeBin": "claude",
+  "workdir": "",
+  "timeoutSeconds": 600,
+  "mergeSeconds": 3,
+  "maxReplyChars": 26000,
+
+  "claudePermissionMode": "bypassPermissions",
+  "allowedTools": "",
+  "replyFormat": "text",
+  "appendSystemPrompt": "",
+
+  "ffmpegPath": "",
+  "transcribeCommand": "",
+  "ocrCommand": ""
+}

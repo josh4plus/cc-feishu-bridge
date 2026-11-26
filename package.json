@@ -1,0 +1,17 @@
+{
+  "name": "cc-feishu-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "把 Claude Code 接到飞书：长连接收消息，常驻 claude 会话回复",
+  "scripts": {
+    "probe": "node probe.mjs",
+    "start": "node bridge.mjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.76.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
