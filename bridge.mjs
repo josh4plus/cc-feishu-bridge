@@ -10,6 +10,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,6 +52,8 @@ const REPLY_FORMAT = config.replyFormat === 'post' ? 'post' : 'text';
 const PERM_MODE = config.claudePermissionMode === undefined ? 'bypassPermissions' : config.claudePermissionMode;
 const EXTRA_PROMPT = config.appendSystemPrompt || '';
 const MERGE_MS = config.mergeSeconds ? config.mergeSeconds * 1000 : 3000;
+const STREAM = config.stream !== false;                    // 流式卡片开关，默认开
+const STREAM_INTERVAL = config.streamIntervalMs ?? 500;    // 两次更新之间的最小间隔
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
@@ -129,6 +132,158 @@ async function react(messageId, emoji) {
 async function unreact(messageId, reactionId) {
   if (!reactionId) return;
   try { await feishu('/im/v1/messages/' + messageId + '/reactions/' + reactionId, 'DELETE'); } catch { /* 忽略 */ }
+}
+
+// ── 流式卡片（CardKit）──────────────────────────────────────────────────
+// 四步：建卡 → 节流更新 → 失败重开 → 收尾关掉 streaming_mode。
+// 不关最后那步的话，飞书会话列表会一直显示"正在生成"。
+const STREAM_ELEMENT = 'stream_md';
+
+function streamCardJson() {
+  return {
+    schema: '2.0',
+    config: {
+      streaming_mode: true,
+      summary: { content: '[生成中]' },
+      streaming_config: { print_frequency_ms: { default: 70 }, print_step: { default: 1 }, print_strategy: 'fast' },
+    },
+    body: { elements: [{ tag: 'markdown', element_id: STREAM_ELEMENT, content: '' }] },
+  };
+}
+
+/** 建卡片实体并发到会话（挂在触发消息下，用户才会收到提醒）。失败返回 null。 */
+async function createStreamCard(chatId, replyToMessageId) {
+  const created = await feishu('/cardkit/v1/cards', 'POST', {
+    type: 'card_json',
+    data: JSON.stringify(streamCardJson()),
+  });
+  if (created.code !== 0) { log(`✗ 建卡失败 ${created.code} ${created.msg}`); return null; }
+  const cardId = created.data?.card_id;
+  if (!cardId) return null;
+
+  const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+  try {
+    if (replyToMessageId) {
+      const j = await feishu('/im/v1/messages/' + replyToMessageId + '/reply', 'POST', {
+        msg_type: 'interactive', content,
+      });
+      if (j.code !== 0) throw new Error(`${j.code} ${j.msg}`);
+    } else {
+      const j = await feishu('/im/v1/messages?receive_id_type=chat_id', 'POST', {
+        receive_id: chatId, msg_type: 'interactive', content,
+      });
+      if (j.code !== 0) throw new Error(`${j.code} ${j.msg}`);
+    }
+  } catch (e) {
+    log(`✗ 建了卡但发不出去：${e.message}`);
+    return null;
+  }
+  return cardId;
+}
+
+async function updateStreamText(cardId, text, sequence) {
+  const j = await feishu(
+    `/cardkit/v1/cards/${cardId}/elements/${STREAM_ELEMENT}/content`, 'PUT',
+    { content: text, sequence },
+  );
+  if (j.code !== 0) { log(`✗ 更新卡片 ${j.code} ${j.msg}`); return false; }
+  return true;
+}
+
+async function setStreamingMode(cardId, enabled, sequence) {
+  const j = await feishu(`/cardkit/v1/cards/${cardId}/settings`, 'PATCH', {
+    settings: JSON.stringify({ config: { streaming_mode: enabled } }),
+    sequence,
+    uuid: randomUUID(),
+  });
+  if (j.code !== 0) { log(`✗ 设置 streaming=${enabled} ${j.code} ${j.msg}`); return false; }
+  return true;
+}
+
+/**
+ * 建卡 + 节流更新的持有者。
+ * push() 是同步的：只记最新文本，由内部定时器按节流节奏往飞书推。
+ */
+class StreamCard {
+  constructor(chatId, replyToMessageId) {
+    this.chatId = chatId;
+    this.replyTo = replyToMessageId;
+    this.cardId = null;
+    this.text = '';
+    this.sequence = 0;
+    this.lastSendAt = 0;      // 上次「决定发送」的时刻，节流的锚点
+    this.failed = false;
+    this.timer = null;
+    this.chain = Promise.resolve();   // 所有更新排队串行，避免 PUT 乱序
+  }
+
+  async start() {
+    this.cardId = await createStreamCard(this.chatId, this.replyTo);
+    if (!this.cardId) this.failed = true;
+    return this.cardId;
+  }
+
+  /** 只记录文本；按节流节奏决定何时真的推 */
+  push(text) {
+    this.text = truncate(text);
+    if (this.failed || !this.cardId) return;
+    const wait = this.lastSendAt + STREAM_INTERVAL - Date.now();
+    if (wait <= 0) this.send();
+    else if (!this.timer) {
+      this.timer = setTimeout(() => { this.timer = null; this.send(); }, wait);
+    }
+  }
+
+  /** 同步登记一次发送（锚点立刻更新），实际请求排队执行 */
+  send() {
+    if (this.failed || !this.cardId) return this.chain;
+    this.lastSendAt = Date.now();
+    const snapshot = this.text;
+    this.chain = this.chain.then(() => this.doUpdate(snapshot)).catch(() => {});
+    return this.chain;
+  }
+
+  async doUpdate(snapshot) {
+    if (this.failed || !this.cardId) return;
+    const seq = ++this.sequence;
+    let ok = await updateStreamText(this.cardId, snapshot, seq);
+    if (!ok) {
+      // 飞书会因超时把 streaming_mode 关掉，单靠重试救不回来，必须先重开
+      this.sequence = seq + 1;
+      if (await setStreamingMode(this.cardId, true, this.sequence)) {
+        this.sequence += 1;
+        ok = await updateStreamText(this.cardId, snapshot, this.sequence);
+      }
+    }
+    if (!ok) {
+      this.failed = true;
+      log('✗ 流式更新连续失败，改用普通消息');
+    }
+  }
+
+  /** 收尾：等排队中的更新落定，推最终内容，再显式关掉 streaming_mode */
+  async finish() {
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    if (this.failed || !this.cardId) return false;
+    await this.chain;
+    if (this.failed) return false;
+
+    this.sequence += 1;
+    let ok = await updateStreamText(this.cardId, this.text, this.sequence);
+    if (!ok) {
+      this.sequence += 1;
+      await setStreamingMode(this.cardId, true, this.sequence);
+      this.sequence += 1;
+      ok = await updateStreamText(this.cardId, this.text, this.sequence);
+      if (!ok) { this.failed = true; return false; }
+    }
+    this.sequence += 1;
+    if (!await setStreamingMode(this.cardId, false, this.sequence)) {
+      this.sequence += 1;
+      await setStreamingMode(this.cardId, false, this.sequence);
+    }
+    return true;
+  }
 }
 
 // ── 附件处理 ──────────────────────────────────────────────────────────
@@ -339,15 +494,34 @@ function askOnce(chatId, prompt, onProgress) {
 async function handleTurn(chatId, prompt, parts) {
   const state = loadState();
   const triggerId = parts.length ? parts[0].msgId : null;
-  const res = await askOnce(chatId, prompt, async () => {});
+
+  const card = STREAM ? new StreamCard(chatId, triggerId) : null;
+  if (card) await card.start();
+
+  let res;
+  try {
+    res = await askOnce(chatId, prompt, (live) => { if (card) card.push(live); });
+  } catch (e) {
+    // 卡片已经发出去了，异常也要把卡收尾，否则会一直显示"生成中"
+    res = { text: `❌ 处理失败：${e.message}`, sessionId: null };
+  }
 
   state[chatId] = { sessionId: res.sessionId, updated: new Date().toISOString() };
   saveState(state);
   log(`→ 回复 ${res.text.length} 字`);
 
+  // 流式卡片成功就到此为止；建卡失败或中途失败才退回普通消息
+  let streamed = false;
+  if (card && !card.failed) {
+    card.text = truncate(res.text || card.text);
+    streamed = await card.finish();
+  }
+
   try {
-    if (triggerId) await replyMessage(triggerId, res.text);   // 回复原消息 → 用户收到提醒
-    else await createMessage(chatId, res.text);
+    if (!streamed) {
+      if (triggerId) await replyMessage(triggerId, res.text);   // 回复原消息 → 用户收到提醒
+      else await createMessage(chatId, res.text);
+    }
   } catch (e) {
     log(`✗ 发送失败：${e.message}`);
   }
