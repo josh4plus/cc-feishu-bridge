@@ -139,6 +139,13 @@ async function unreact(messageId, reactionId) {
 // 不关最后那步的话，飞书会话列表会一直显示"正在生成"。
 const STREAM_ELEMENT = 'stream_md';
 
+/** 收尾时写进会话列表的一行摘要：取正文首个非空行，去掉 markdown 记号 */
+function summarize(text, max = 30) {
+  const line = String(text || '').split('\n').map((s) => s.trim()).find(Boolean) || '已完成';
+  const clean = line.replace(/[*_`#>]/g, '').trim();
+  return clean.length > max ? clean.slice(0, max) + '…' : clean;
+}
+
 function streamCardJson() {
   return {
     schema: '2.0',
@@ -190,9 +197,12 @@ async function updateStreamText(cardId, text, sequence) {
   return true;
 }
 
-async function setStreamingMode(cardId, enabled, sequence) {
+async function setStreamingMode(cardId, enabled, sequence, summary) {
+  // 只关 streaming_mode 不换 summary，飞书会话列表会一直显示建卡时的「[生成中]」
+  const cfg = { streaming_mode: enabled };
+  if (summary) cfg.summary = { content: summary };
   const j = await feishu(`/cardkit/v1/cards/${cardId}/settings`, 'PATCH', {
-    settings: JSON.stringify({ config: { streaming_mode: enabled } }),
+    settings: JSON.stringify({ config: cfg }),
     sequence,
     uuid: randomUUID(),
   });
@@ -278,9 +288,10 @@ class StreamCard {
       if (!ok) { this.failed = true; return false; }
     }
     this.sequence += 1;
-    if (!await setStreamingMode(this.cardId, false, this.sequence)) {
+    const summary = summarize(this.text);
+    if (!await setStreamingMode(this.cardId, false, this.sequence, summary)) {
       this.sequence += 1;
-      await setStreamingMode(this.cardId, false, this.sequence);
+      await setStreamingMode(this.cardId, false, this.sequence, summary);
     }
     return true;
   }
